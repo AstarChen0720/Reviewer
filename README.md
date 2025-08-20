@@ -1,2 +1,19 @@
-# Reviewer
-a machine can help you review what you learned by AI article
+所以我現在分成三個部分
+
+1. 原始資料蒐集: 
+   - 文法: 網路上文章
+   - 單字: ankidecks
+2. database: Remnote 
+   1. 先將所有的單字、句子、文法都匯入Remnote
+      1. 匯入單字卡:
+         1. 本是太lag，改只上傳n5。結果整個排版爆，都變成tag
+         2. 換純文字txt結果根本上傳不了(notion有試他說檔案太大)
+         3. 他裡面有html，改成html
+         4. 都不行改用obsidian
+   2. 學習後分到三個box:沒印象、不熟、熟了
+3. reviewer 
+   1. 提取boxes裡面的資料做成文章
+   2. 文章裡面會高量顯示我學過的東西(不同區域的會有不同標)
+   3. 看文章時若預不會可以popup顯示筆記內容
+   4. 看完可以看到剛剛文章有出現的三個box裡面的東西，並且可以手動移動
+     - 以後可以做在popup裡面選，或用滑鼠停留時間決定(更加無感) 
