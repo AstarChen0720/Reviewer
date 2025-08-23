@@ -1,4 +1,4 @@
-export type Box = 'stash' | 'box1' | 'box2' | 'box3';
+export type Box = 'stash' | 'box1' | 'box2' | 'box3' | 'trash';
 
 export type Block = {
   id: string;

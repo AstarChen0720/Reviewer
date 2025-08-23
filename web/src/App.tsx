@@ -2,20 +2,21 @@ import { useEffect, useMemo, useState } from 'react';
 import { DndContext, type DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable';
 import { DropZone } from './components/DropZone';
-import { TrashBin } from './components/TrashBin';
+// TrashBin 不再用刪除區 (保留檔案但不使用)
 import { DraggableItem } from './components/DraggableItem';
 import type { Block, Box } from './types';
 import { splitToBlocks } from './utils/split';
 import { db } from './storage/db';
-import { getAllByBox, bulkAdd, upsert, remove, clearAll as clearAllDB } from './storage/repo';
+import { getAllByBox, bulkAdd, upsert, clearAll as clearAllDB } from './storage/repo';
 import { Reader } from './components/Reader';
 
-const boxes: Box[] = ['stash', 'box1', 'box2', 'box3'];
+const boxes: Box[] = ['stash', 'box1', 'box2', 'box3', 'trash'];
 export const boxLabels: Record<Box, string> = {
   stash: '暫存',
   box1: '沒印象',
   box2: '不熟',
   box3: '熟悉',
+  trash: '回收',
 };
 
 export default function App() {
@@ -41,12 +42,12 @@ export default function App() {
         } catch {}
       }
       const grouped = await getAllByBox();
-      setBlocks([ ...grouped.stash, ...grouped.box1, ...grouped.box2, ...grouped.box3 ]);
+  setBlocks([ ...grouped.stash, ...grouped.box1, ...grouped.box2, ...grouped.box3, ...grouped.trash ]);
     })();
   }, []);
 
   const byBox = useMemo(() => {
-    const map: Record<Box, Block[]> = { stash: [], box1: [], box2: [], box3: [] };
+  const map: Record<Box, Block[]> = { stash: [], box1: [], box2: [], box3: [], trash: [] };
     for (const b of blocks) map[b.box].push(b);
     for (const k of boxes) map[k].sort((a, b) => a.position - b.position);
     return map;
@@ -67,37 +68,17 @@ export default function App() {
     const overId = e.over?.id?.toString(); // 可能是 'trash'、容器 id 或項目 id
     if (!overId) return;
 
-    if (overId === 'trash') {
-      setBlocks(prev => {
-        const removed = prev.find(b => b.id === activeId);
-        const next = prev.filter(b => b.id !== activeId);
-        if (removed) {
-          // 重新編號原容器 position
-          const updatedSrc = next
-            .filter(b => b.box === removed.box)
-            .sort((a,b)=>a.position-b.position)
-            .map((b, i) => ({ ...b, position: i }));
-          const others = next.filter(b => b.box !== removed.box);
-          const merged = [...others, ...updatedSrc];
-          updatedSrc.forEach(b => void upsert(b));
-          void remove(activeId);
-          return merged;
-        }
-        void remove(activeId);
-        return next;
-      });
-      return;
-    }
+  // 不再有直接刪除行為，trash 當作普通 box
 
     const activeBlock = blocks.find(b => b.id === activeId);
     if (!activeBlock) return;
 
     // 語言分隔容器: box1-ja / box1-en 等
-    const langContainerMatch = overId.match(/^(box[123])-(ja|en)$/);
+  const langContainerMatch = overId.match(/^(box[123])-(ja|en)$/);
     const isBaseBox = (boxes as string[]).includes(overId);
     if (langContainerMatch || isBaseBox) {
       // 放到容器尾端
-      const targetBox = (langContainerMatch ? langContainerMatch[1] : overId) as Box;
+  const targetBox = (langContainerMatch ? langContainerMatch[1] : overId) as Box;
       const targetLang = langContainerMatch ? (langContainerMatch[2] as 'ja'|'en') : undefined;
       // 若有語言限制, 且項目語言不同, 不動作
       if (targetLang && activeBlock.lang !== targetLang) return;
@@ -127,7 +108,7 @@ export default function App() {
 
     setBlocks(prev => {
       // 取出目標容器與來源容器的當前順序
-      const listBy = (box: Box) => prev.filter(b => b.box === box).sort((a,b)=>a.position-b.position);
+  const listBy = (box: Box) => prev.filter(b => b.box === box).sort((a,b)=>a.position-b.position);
       const srcBox = activeBlock.box;
       const srcList = listBy(srcBox).filter(b => b.id !== activeId);
       const dstList = listBy(targetBox);
@@ -247,6 +228,19 @@ export default function App() {
               {byBox.stash.filter(b=>!search.stash || b.text.includes(search.stash)).map(b=> <DraggableItem key={b.id} block={b} />)}
             </DropZone>
           </SortableContext>
+          {/* Trash 單一容器 (不分語言) */}
+          <SortableContext items={byBox.trash.filter(b=>!search.trash || b.text.includes(search.trash)).map(b=>b.id)} strategy={verticalListSortingStrategy}>
+            <DropZone
+              id="trash"
+              title={boxLabels.trash}
+              colorClass="zone-trash"
+              showSearch
+              search={search.trash||''}
+              onSearchChange={v=>setSearch(s=>({...s,trash:v}))}
+            >
+              {byBox.trash.filter(b=>!search.trash || b.text.includes(search.trash)).map(b=> <DraggableItem key={b.id} block={b} />)}
+            </DropZone>
+          </SortableContext>
           {/* 上排 日文 */}
           {(['box1','box2','box3'] as Box[]).map(box => {
             const list = byBox[box].filter(b=>b.lang==='ja').filter(b=>!search[box] || b.text.includes(search[box]!));
@@ -283,7 +277,6 @@ export default function App() {
               </SortableContext>
             );
           })}
-          <TrashBin />
         </DndContext>
       </main>
       ) : (
