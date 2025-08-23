@@ -23,6 +23,7 @@ export default function App() {
   const [mode, setMode] = useState<'auto'|'line'|'sentence'|'separator'>('auto');
   const [view, setView] = useState<'board'|'reader'>('board');
   const [blocks, setBlocks] = useState<Block[]>([]);
+  const [search, setSearch] = useState<{[k in Box]?: string}>({});
 
   // 初始讀取：先嘗試把 localStorage 舊資料搬到 Dexie（一次性）
   useEffect(() => {
@@ -91,9 +92,15 @@ export default function App() {
     const activeBlock = blocks.find(b => b.id === activeId);
     if (!activeBlock) return;
 
-    if ((boxes as string[]).includes(overId)) {
+    // 語言分隔容器: box1-ja / box1-en 等
+    const langContainerMatch = overId.match(/^(box[123])-(ja|en)$/);
+    const isBaseBox = (boxes as string[]).includes(overId);
+    if (langContainerMatch || isBaseBox) {
       // 放到容器尾端
-      const targetBox = overId as Box;
+      const targetBox = (langContainerMatch ? langContainerMatch[1] : overId) as Box;
+      const targetLang = langContainerMatch ? (langContainerMatch[2] as 'ja'|'en') : undefined;
+      // 若有語言限制, 且項目語言不同, 不動作
+      if (targetLang && activeBlock.lang !== targetLang) return;
       if (activeBlock.box === targetBox) return;
       setBlocks(prev => {
         const next = [...prev];
@@ -176,6 +183,25 @@ export default function App() {
   void clearAllDB();
   }
 
+  function autoImportFromStash() {
+    setBlocks(prev => {
+      const box1Items = prev.filter(b => b.box==='box1').sort((a,b)=>a.position-b.position);
+      let pos = box1Items.length;
+      const mapped = prev.map(b => {
+        if (b.box==='stash' && (b.lang==='ja' || b.lang==='en')) {
+          const updated = { ...b, box:'box1' as Box, position: pos++ };
+          void upsert(updated);
+          return updated;
+        }
+        return b;
+      });
+      // 重排暫存
+      const stashOrdered = mapped.filter(b=>b.box==='stash').sort((a,b)=>a.position-b.position);
+      stashOrdered.forEach((b,i)=>{ if (b.position!==i){ b.position=i; void upsert(b);} });
+      return mapped;
+    });
+  }
+
   return (
     <div>
     <header className="topbar">
@@ -190,11 +216,11 @@ export default function App() {
       </header>
 
     {view === 'board' ? (
-    <main className="grid">
-        <section className="panel">
+  <main className="grid board-grid">
+        <section className="panel input-panel">
           <h2>貼上文字 → 轉成 Blocks</h2>
           <textarea value={text} onChange={e => setText(e.target.value)} placeholder="每行或空行切分。" id="paste" />
-          <div className="row" style={{ display:'flex', gap:8, alignItems:'center' }}>
+          <div className="row" style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
             <button onClick={addFromText}>切成 Blocks</button>
             <label style={{ fontSize:12, color:'#555' }}>切分模式：</label>
             <select value={mode} onChange={e => setMode(e.target.value as any)}>
@@ -204,22 +230,59 @@ export default function App() {
               <option value="separator">按分隔符（、，,；;/| 或空白）</option>
             </select>
           </div>
-          <p className="hint">拖動任意項目到右側的 Box。</p>
+          <p className="hint">右側：上排 日本語 (日)；下排 English (英)。可搜尋、拖動。同一難度 Box 兩行共享資料。</p>
         </section>
-
         <DndContext onDragEnd={onDragEnd}>
-          <SortableContext items={byBox.stash.map(b=>b.id)} strategy={verticalListSortingStrategy}>
-            <DropZone id="stash" title={boxLabels.stash}>{byBox.stash.map(b => <DraggableItem key={b.id} block={b} />)}</DropZone>
+          {/* 暫存只一個 */}
+          <SortableContext items={byBox.stash.filter(b=>!search.stash || b.text.includes(search.stash)).map(b=>b.id)} strategy={verticalListSortingStrategy}>
+            <DropZone
+              id="stash"
+              title={boxLabels.stash}
+              colorClass="zone-stash"
+              showSearch
+              search={search.stash||''}
+              onSearchChange={v=>setSearch(s=>({...s,stash:v}))}
+              actions={<button type="button" onClick={autoImportFromStash} style={{ background:'#6366f1' }}>自動導入</button>}
+            >
+              {byBox.stash.filter(b=>!search.stash || b.text.includes(search.stash)).map(b=> <DraggableItem key={b.id} block={b} />)}
+            </DropZone>
           </SortableContext>
-          <SortableContext items={byBox.box1.map(b=>b.id)} strategy={verticalListSortingStrategy}>
-            <DropZone id="box1" title={boxLabels.box1}>{byBox.box1.map(b => <DraggableItem key={b.id} block={b} />)}</DropZone>
-          </SortableContext>
-          <SortableContext items={byBox.box2.map(b=>b.id)} strategy={verticalListSortingStrategy}>
-            <DropZone id="box2" title={boxLabels.box2}>{byBox.box2.map(b => <DraggableItem key={b.id} block={b} />)}</DropZone>
-          </SortableContext>
-          <SortableContext items={byBox.box3.map(b=>b.id)} strategy={verticalListSortingStrategy}>
-            <DropZone id="box3" title={boxLabels.box3}>{byBox.box3.map(b => <DraggableItem key={b.id} block={b} />)}</DropZone>
-          </SortableContext>
+          {/* 上排 日文 */}
+          {(['box1','box2','box3'] as Box[]).map(box => {
+            const list = byBox[box].filter(b=>b.lang==='ja').filter(b=>!search[box] || b.text.includes(search[box]!));
+            return (
+              <SortableContext key={box+'-ja'} items={list.map(b=>b.id)} strategy={verticalListSortingStrategy}>
+                <DropZone
+                  id={`${box}-ja`}
+                  title={`${boxLabels[box]} (日)`}
+                  colorClass={`zone-${box} zone-${box}-ja`}
+                  showSearch
+                  search={search[box]||''}
+                  onSearchChange={v=>setSearch(s=>({...s,[box]:v}))}
+                >
+                  {list.map(b=> <DraggableItem key={b.id} block={b} />)}
+                </DropZone>
+              </SortableContext>
+            );
+          })}
+          {/* 下排 英文 */}
+          {(['box1','box2','box3'] as Box[]).map(box => {
+            const list = byBox[box].filter(b=>b.lang==='en').filter(b=>!search[box] || b.text.includes(search[box]!));
+            return (
+              <SortableContext key={box+'-en'} items={list.map(b=>b.id)} strategy={verticalListSortingStrategy}>
+                <DropZone
+                  id={`${box}-en`}
+                  title={`${boxLabels[box]} (英)`}
+                  colorClass={`zone-${box} zone-${box}-en`}
+                  showSearch
+                  search={search[box]||''}
+                  onSearchChange={v=>setSearch(s=>({...s,[box]:v}))}
+                >
+                  {list.map(b=> <DraggableItem key={b.id} block={b} />)}
+                </DropZone>
+              </SortableContext>
+            );
+          })}
           <TrashBin />
         </DndContext>
       </main>
