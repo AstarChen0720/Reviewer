@@ -25,6 +25,8 @@ export default function App() {
   const [view, setView] = useState<'board'|'reader'>('board');
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [search, setSearch] = useState<{[k in Box]?: string}>({});
+  const [trashSelectMode, setTrashSelectMode] = useState(false);
+  const [selectedTrashIds, setSelectedTrashIds] = useState<Set<string>>(new Set());
 
   // 初始讀取：先嘗試把 localStorage 舊資料搬到 Dexie（一次性）
   useEffect(() => {
@@ -164,6 +166,57 @@ export default function App() {
   void clearAllDB();
   }
 
+  function toggleSelectTrash(id: string) {
+    setSelectedTrashIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function enterTrashSelectMode() {
+    setTrashSelectMode(true);
+    setSelectedTrashIds(new Set());
+  }
+
+  function exitTrashSelectMode() {
+    setTrashSelectMode(false);
+    setSelectedTrashIds(new Set());
+  }
+
+  function deleteAllInTrash() {
+    if (!byBox.trash.length) return;
+    if (!confirm('刪除回收桶所有項目？(無法復原)')) return;
+    setBlocks(prev => prev.filter(b => b.box !== 'trash'));
+    // 從 DB 移除
+    byBox.trash.forEach(b => { void db.items.delete(b.id); });
+    exitTrashSelectMode();
+  }
+
+  function restoreTrash(ids?: string[]) {
+    const targetIds = ids && ids.length ? ids : byBox.trash.map(b => b.id);
+    if (!targetIds.length) return;
+    setBlocks(prev => {
+      const next = [...prev];
+      // 找出 box1 當前末尾位置 (回復到 box1 末尾；或若原本有 box 標記可用 metadata，但目前單純回到暫存 stash? 需求說回到 box 裡面 -> 假設回 box1)
+      const basePos = byBox.box1.length; // 使用 memo 內資料
+      let offset = 0;
+      for (const id of targetIds) {
+        const idx = next.findIndex(b => b.id === id && b.box === 'trash');
+        if (idx >= 0) {
+          const updated = { ...next[idx], box: 'box1' as Box, position: basePos + offset++ };
+          next[idx] = updated;
+          void upsert(updated);
+        }
+      }
+      // trash 重新排序 (移除後其餘 position 重排)
+      const trashRest = next.filter(b => b.box === 'trash').sort((a,b)=>a.position-b.position);
+      trashRest.forEach((b,i)=>{ if (b.position!==i){ b.position=i; void upsert(b);} });
+      return next;
+    });
+    exitTrashSelectMode();
+  }
+
   function autoImportFromStash() {
     setBlocks(prev => {
       const box1Items = prev.filter(b => b.box==='box1').sort((a,b)=>a.position-b.position);
@@ -237,8 +290,21 @@ export default function App() {
               showSearch
               search={search.trash||''}
               onSearchChange={v=>setSearch(s=>({...s,trash:v}))}
+              actions={
+                <div style={{ display:'flex', gap:4 }}>
+                  <button type="button" onClick={()=>restoreTrash()}>回復</button>
+                  <button type="button" onClick={deleteAllInTrash} style={{ background:'#dc2626', color:'#fff' }}>刪除</button>
+                  {!trashSelectMode && <button type="button" onClick={enterTrashSelectMode}>選取</button>}
+                  {trashSelectMode && <>
+                    <button type="button" onClick={()=>restoreTrash(Array.from(selectedTrashIds))} disabled={!selectedTrashIds.size}>回復已選</button>
+                    <button type="button" onClick={exitTrashSelectMode}>取消</button>
+                  </>}
+                </div>
+              }
             >
-              {byBox.trash.filter(b=>!search.trash || b.text.includes(search.trash)).map(b=> <DraggableItem key={b.id} block={b} />)}
+              {byBox.trash
+                .filter(b=>!search.trash || b.text.includes(search.trash))
+                .map(b=> <DraggableItem key={b.id} block={b} selectable={trashSelectMode} selected={selectedTrashIds.has(b.id)} onToggleSelect={toggleSelectTrash} />)}
             </DropZone>
           </SortableContext>
           {/* 上排 日文 */}
