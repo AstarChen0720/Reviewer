@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { DndContext, DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { DraggableItem } from './DraggableItem';
@@ -39,6 +39,7 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   const [maxLength, setMaxLength] = useState(500);
   const [generating, setGenerating] = useState(false);
   const [lastLang, setLastLang] = useState<'ja'|'en' | null>(null);
+  const loadedConfigRef = useRef(false);
 
   // 初始化從 localStorage 載入暫存文章
   useEffect(() => {
@@ -46,8 +47,38 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     if (raw) setArticle(raw);
     const storedLang = localStorage.getItem('reviewer.lastLang');
     if (storedLang === 'ja' || storedLang === 'en') setLastLang(storedLang);
+    // 載入參數設定
+    const cfgRaw = localStorage.getItem('reviewer.reader.config.v1');
+    if (cfgRaw) {
+      try {
+        const cfg = JSON.parse(cfgRaw);
+        if (typeof cfg.totalWanted === 'number') setTotalWanted(cfg.totalWanted);
+        if (cfg.overrideBox1 === '' || typeof cfg.overrideBox1 === 'number') setOverrideBox1(cfg.overrideBox1);
+        if (cfg.overrideBox2 === '' || typeof cfg.overrideBox2 === 'number') setOverrideBox2(cfg.overrideBox2);
+        if (cfg.overrideBox3 === '' || typeof cfg.overrideBox3 === 'number') setOverrideBox3(cfg.overrideBox3);
+        if (typeof cfg.targetSentences === 'number') setTargetSentences(cfg.targetSentences);
+        if (typeof cfg.style === 'string') setStyle(cfg.style);
+        if (typeof cfg.maxLength === 'number') setMaxLength(cfg.maxLength);
+      } catch {}
+    }
+    loadedConfigRef.current = true;
     refreshList();
   }, []);
+
+  // 保存設定
+  useEffect(() => {
+    if (!loadedConfigRef.current) return; // 避免初始載入前覆寫
+    const cfg = {
+      totalWanted,
+      overrideBox1,
+      overrideBox2,
+      overrideBox3,
+      targetSentences,
+      style,
+      maxLength,
+    };
+    localStorage.setItem('reviewer.reader.config.v1', JSON.stringify(cfg));
+  }, [totalWanted, overrideBox1, overrideBox2, overrideBox3, targetSentences, style, maxLength]);
 
   // 開發/暫時使用：可在 console 呼叫 window.setArticle('內容') 注入文章
   useEffect(() => {
@@ -272,6 +303,37 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   return (
     <main className="reader-area">
       <section className="panel reader-panel">
+        {/* 移到標題上方的可折疊區塊 */}
+        <details style={{ marginBottom:12 }}>
+          <summary style={{ cursor:'pointer', fontWeight:600 }}>Prompt (可編輯)</summary>
+          <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} style={{ width:'100%', minHeight:160, marginTop:8, fontFamily:'monospace', fontSize:12 }} />
+          {lastLang && <div className="hint" style={{ marginTop:4 }}>目前語言: {lastLang}</div>}
+        </details>
+        <details style={{ marginBottom: 12 }}>
+          <summary style={{ cursor:'pointer', fontWeight:600 }}>已保存文章 ({loadingList?'載入中...':articles.length})</summary>
+          <div style={{ display:'flex', gap:8, flexWrap:'wrap', margin:'8px 0' }}>
+            {!selectMode && <button type="button" disabled={!articles.length} onClick={()=>setSelectMode(true)}>選取刪除</button>}
+            {selectMode && <>
+              <button type="button" onClick={exitSelectMode}>取消</button>
+              <button type="button" disabled={!selectedIds.size} onClick={bulkDeleteSelected}>刪除已選({selectedIds.size})</button>
+              <button type="button" onClick={()=>setSelectedIds(new Set(articles.map(a=>a.id)))}>全選</button>
+            </>}
+            <button type="button" disabled={!articles.length} onClick={deleteAllArticles}>全部清除</button>
+          </div>
+          {articles.length === 0 && !loadingList && <div className="hint" style={{ padding:'4px 0' }}>尚無保存文章</div>}
+          <ul style={{ listStyle:'none', margin:8, padding:0, display:'flex', flexDirection:'column', gap:4, maxHeight:200, overflow:'auto' }}>
+            {articles.map(a => (
+              <li key={a.id} style={{ display:'flex', alignItems:'center', gap:8, fontSize:13, background: selectMode && selectedIds.has(a.id)? '#fee2e2':'transparent', padding:'2px 4px', borderRadius:4 }}>
+                {selectMode && (
+                  <input type="checkbox" checked={selectedIds.has(a.id)} onChange={()=>toggleSelect(a.id)} />
+                )}
+                <button style={{ padding:'4px 8px', background:'#fff', color:'#111', border:'1px solid var(--border)' }} disabled={loadingArticleId===a.id} onClick={()=>loadArticle(a.id)}>載入</button>
+                <span style={{ flex:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{new Date(a.createdAt).toLocaleString()} · {a.lang} · {a.raw.slice(0,40).replace(/\n/g,' ')}{a.raw.length>40?'…':''}</span>
+                {!selectMode && <button style={{ background:'#dc2626' }} onClick={()=>removeArticle(a.id)}>刪除</button>}
+              </li>
+            ))}
+          </ul>
+        </details>
         <h2 style={{ marginBottom: 4 }}>AI 文章閱讀</h2>
         <div className="legend hint" style={{ marginBottom: 12 }}>
           顏色：{boxLabels.box1}=紅、{boxLabels.box2}=橙、{boxLabels.box3}=綠
@@ -302,40 +364,12 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
           </label>
           <label>MaxLen <input type="number" value={maxLength} min={100} style={{ width:70 }} onChange={e=>setMaxLength(Number(e.target.value)||500)} /></label>
         </div>
-        <details style={{ marginBottom:12 }} open>
-          <summary style={{ cursor:'pointer', fontWeight:600 }}>Prompt (可編輯)</summary>
-          <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} style={{ width:'100%', minHeight:160, marginTop:8, fontFamily:'monospace', fontSize:12 }} />
-          {lastLang && <div className="hint" style={{ marginTop:4 }}>目前語言: {lastLang}</div>}
-        </details>
+  {/* Prompt 區塊已上移並預設收起 */}
         {lastSampleInfo && <details className="hint" style={{ marginBottom:12 }}>
           <summary style={{ cursor:'pointer' }}>抽樣細節</summary>
           <pre style={{ whiteSpace:'pre-wrap', fontSize:11, lineHeight:1.4 }}>{lastSampleInfo}</pre>
         </details>}
-        <details style={{ marginBottom: 16 }} open>
-          <summary style={{ cursor:'pointer', fontWeight:600 }}>已保存文章 ({loadingList?'載入中...':articles.length})</summary>
-          <div style={{ display:'flex', gap:8, flexWrap:'wrap', margin:'8px 0' }}>
-            {!selectMode && <button type="button" disabled={!articles.length} onClick={()=>setSelectMode(true)}>選取刪除</button>}
-            {selectMode && <>
-              <button type="button" onClick={exitSelectMode}>取消</button>
-              <button type="button" disabled={!selectedIds.size} onClick={bulkDeleteSelected}>刪除已選({selectedIds.size})</button>
-              <button type="button" onClick={()=>setSelectedIds(new Set(articles.map(a=>a.id)))}>全選</button>
-            </>}
-            <button type="button" disabled={!articles.length} onClick={deleteAllArticles}>全部清除</button>
-          </div>
-          {articles.length === 0 && !loadingList && <div className="hint" style={{ padding:'4px 0' }}>尚無保存文章</div>}
-          <ul style={{ listStyle:'none', margin:8, padding:0, display:'flex', flexDirection:'column', gap:4, maxHeight:200, overflow:'auto' }}>
-            {articles.map(a => (
-              <li key={a.id} style={{ display:'flex', alignItems:'center', gap:8, fontSize:13, background: selectMode && selectedIds.has(a.id)? '#fee2e2':'transparent', padding:'2px 4px', borderRadius:4 }}>
-                {selectMode && (
-                  <input type="checkbox" checked={selectedIds.has(a.id)} onChange={()=>toggleSelect(a.id)} />
-                )}
-                <button style={{ padding:'4px 8px', background:'#fff', color:'#111', border:'1px solid var(--border)' }} disabled={loadingArticleId===a.id} onClick={()=>loadArticle(a.id)}>載入</button>
-                <span style={{ flex:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{new Date(a.createdAt).toLocaleString()} · {a.lang} · {a.raw.slice(0,40).replace(/\n/g,' ')}{a.raw.length>40?'…':''}</span>
-                {!selectMode && <button style={{ background:'#dc2626' }} onClick={()=>removeArticle(a.id)}>刪除</button>}
-              </li>
-            ))}
-          </ul>
-        </details>
+  {/* 已保存文章區塊已上移並預設收起 */}
         {article ? (
           <div className="article" dangerouslySetInnerHTML={{ __html: highlighted }} />
         ) : (
