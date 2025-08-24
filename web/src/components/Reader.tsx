@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Block } from '../types';
 import { boxLabels } from '../App';
 
@@ -11,7 +11,14 @@ const colors: Record<string, string> = {
 };
 
 export function Reader({ blocks }: { blocks: Block[] }) {
+  // 將來會由 AI 生成文章 -> 這裡暫時保留 state，但不提供輸入框
   const [article, setArticle] = useState('');
+
+  // 開發/暫時使用：可在 console 呼叫 window.setArticle('內容') 注入文章
+  useEffect(() => {
+    (window as any).setArticle = (s: string) => setArticle(s);
+    return () => { delete (window as any).setArticle; };
+  }, []);
   const dictByBox = useMemo(() => {
     return {
       box1: blocks.filter(b => b.box === 'box1').map(b => b.text).filter(Boolean),
@@ -42,15 +49,17 @@ export function Reader({ blocks }: { blocks: Block[] }) {
   }, [article, dictByBox]);
 
   return (
-    <main className="grid" style={{ gridTemplateColumns: '1fr 2fr' }}>
-      <section className="panel">
-        <h2>閱讀高亮</h2>
-        <textarea value={article} onChange={e=>setArticle(e.target.value)} placeholder="貼上文章內容..." style={{ height: 160 }} />
-        <div className="hint">顏色：{boxLabels.box1}=紅、{boxLabels.box2}=橙、{boxLabels.box3}=綠</div>
-      </section>
-      <section className="panel">
-        <h2>文章</h2>
-        <div dangerouslySetInnerHTML={{ __html: highlighted }} style={{ lineHeight: 1.8 }} />
+    <main className="reader-area">
+      <section className="panel reader-panel">
+        <h2 style={{ marginBottom: 4 }}>AI 文章閱讀</h2>
+        <div className="legend hint" style={{ marginBottom: 12 }}>
+          顏色：{boxLabels.box1}=紅、{boxLabels.box2}=橙、{boxLabels.box3}=綠
+        </div>
+        {article ? (
+          <div className="article" dangerouslySetInnerHTML={{ __html: highlighted }} />
+        ) : (
+          <div className="article empty">尚未載入文章。請在未來的「生成」功能產生內容或在 console 使用 setArticle('...') 注入測試。</div>
+        )}
       </section>
     </main>
   );
