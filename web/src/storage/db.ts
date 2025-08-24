@@ -1,13 +1,17 @@
 import Dexie, { type Table } from 'dexie';
-import type { Block } from '../types';
+import type { Block, Article } from '../types';
 
 export class ReviewerDB extends Dexie {
   items!: Table<Block, string>;
+  articles!: Table<Article, string>;
   constructor() {
     super('reviewer');
     this.version(1).stores({
-      // primary key id, indexes on box and position for quick queries
       items: 'id, box, position'
+    });
+    this.version(2).stores({
+      items: 'id, box, position',
+      articles: 'id, createdAt'
     });
   }
 }

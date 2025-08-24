@@ -142,6 +142,44 @@ export default function App() {
     });
   }
 
+  // 供 Reader 使用：將單一 block 移動到新 box (放在末尾) 並重新排序來源與目標
+  function moveBlockToBox(id: string, targetBox: Box, options?: { prepend?: boolean }) {
+    const prepend = !!options?.prepend;
+    setBlocks(prev => {
+      const next = [...prev];
+      const idx = next.findIndex(b => b.id === id);
+      if (idx < 0) return prev;
+      const orig = next[idx];
+      const fromBox = orig.box;
+      const sameBox = fromBox === targetBox;
+      if (sameBox && !prepend) return prev; // nothing to do
+
+      // Gather target list excluding moving item (if same box)
+      const targetList = next.filter(b => b.box === targetBox && b.id !== id).sort((a,b)=>a.position-b.position);
+
+      if (prepend) {
+        // Shift existing target positions by +1
+        targetList.forEach(b => { b.position = b.position + 1; void upsert(b); });
+        const updated = { ...orig, box: targetBox, position: 0 };
+        next[idx] = updated; void upsert(updated);
+      } else {
+        const newPos = targetList.length;
+        const updated = { ...orig, box: targetBox, position: newPos };
+        next[idx] = updated; void upsert(updated);
+      }
+
+      // Reindex source box if moved between boxes or moved within with prepend
+      if (!sameBox || (sameBox && prepend)) {
+        const sourceList = next.filter(b => b.box === fromBox && b.id !== id).sort((a,b)=>a.position-b.position);
+        sourceList.forEach((b,i)=>{ if (b.position!==i){ b.position=i; void upsert(b);} });
+      }
+      // Ensure target reindex (after prepend shift might create gaps)
+      const finalTarget = next.filter(b => b.box === targetBox).sort((a,b)=>a.position-b.position);
+      finalTarget.forEach((b,i)=>{ if (b.position!==i){ b.position=i; void upsert(b);} });
+      return next;
+    });
+  }
+
   function exportJSON() {
     const blob = new Blob([JSON.stringify(blocks, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -346,7 +384,7 @@ export default function App() {
         </DndContext>
       </main>
       ) : (
-        <Reader blocks={blocks} />
+  <Reader blocks={blocks} moveBlockToBox={moveBlockToBox} />
       )}
     </div>
   );
