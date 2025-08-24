@@ -4,10 +4,10 @@ import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { DraggableItem } from './DraggableItem';
 import type { Block, Article } from '../types';
 import { boxLabels } from '../App';
-import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles } from '../storage/repo';
+import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles, listUnreadArticles, getUnreadArticle, saveUnreadArticle, deleteUnreadArticle, deleteUnreadArticles, clearAllUnreadArticles } from '../storage/repo';
 import { uuid } from '../utils/split';
 import { sampleForLanguage } from '../utils/sampleBlocks';
-import { buildBasePrompt, mockGenerateArticle } from '../utils/ai';
+import { buildBasePrompt, mockGenerateArticle, generateWithGemini } from '../utils/ai';
 
 // 簡單閱讀高亮：使用者貼上文章內容，依據 box 顏色做底線
 // box1: 紅、box2: 橙、box3: 綠
@@ -23,10 +23,15 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   const [saving, setSaving] = useState(false);
   const [lastSavedId, setLastSavedId] = useState<string | null>(null);
   const [articles, setArticles] = useState<Article[]>([]);
+  const [unreadArticles, setUnreadArticles] = useState<Article[]>([]);
   const [loadingList, setLoadingList] = useState(false);
+  const [loadingUnreadList, setLoadingUnreadList] = useState(false);
   const [loadingArticleId, setLoadingArticleId] = useState<string | null>(null);
+  const [loadingUnreadArticleId, setLoadingUnreadArticleId] = useState<string | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selectUnreadMode, setSelectUnreadMode] = useState(false);
+  const [selectedUnreadIds, setSelectedUnreadIds] = useState<Set<string>>(new Set());
   // Sampling configuration state
   const [totalWanted, setTotalWanted] = useState(10);
   const [overrideBox1, setOverrideBox1] = useState<number | ''>('');
@@ -39,6 +44,98 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   const [maxLength, setMaxLength] = useState(500);
   const [generating, setGenerating] = useState(false);
   const [lastLang, setLastLang] = useState<'ja'|'en' | null>(null);
+  const [genLang, setGenLang] = useState<'ja'|'en'>(()=> (lastLang || 'ja'));
+  const [genStatus, setGenStatus] = useState('');
+  const [genError, setGenError] = useState('');
+  // 批次生成
+  const [batchCount, setBatchCount] = useState(1); // 一次要幾篇
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState(0); // 已完成篇數
+  const [batchErrors, setBatchErrors] = useState<string[]>([]);
+  const [cooldownUntil, setCooldownUntil] = useState<number | null>(null);
+  const generationHistoryRef = useRef<number[]>([]); // 儲存每篇成功生成的 timestamp
+  const cancelRef = useRef(false);
+  // 批次執行狀態持久化 key（避免切換工作區/重新整理後進度條消失）
+  const BATCH_KEY = 'reviewer.batch.v1';
+  // 重新整理導入語言選擇
+  const [loadLang, setLoadLang] = useState<'ja'|'en'>(()=> (localStorage.getItem('reviewer.loadLang')==='en'?'en':'ja'));
+
+  function persistBatchState(partial: any) {
+    try {
+      const base = localStorage.getItem(BATCH_KEY);
+      const obj = base ? JSON.parse(base) : {};
+      localStorage.setItem(BATCH_KEY, JSON.stringify({ ...obj, ...partial }));
+    } catch {}
+  }
+  function clearPersistedBatch() {
+    try { localStorage.removeItem(BATCH_KEY); } catch {}
+  }
+
+  // 啟動時讀取歷史（可選，失敗忽略）
+  useEffect(()=>{
+    try {
+      const raw = localStorage.getItem('reviewer.gen.history');
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) generationHistoryRef.current = arr.filter((n:any)=> typeof n === 'number');
+      }
+    } catch {}
+    // 嘗試讀取未完成批次狀態
+    try {
+      const rawBatch = localStorage.getItem(BATCH_KEY);
+      if (rawBatch) {
+        const st = JSON.parse(rawBatch);
+        if (st && st.running && typeof st.total === 'number' && typeof st.completed === 'number') {
+          if (st.completed < st.total) {
+            setBatchRunning(true);
+            setBatchProgress(st.completed);
+            setBatchCount(st.total);
+            // 延後一個 tick，確保 blocks 與設定已載入
+            setTimeout(()=>{
+              resumeBatch(st.total - st.completed, st.total);
+            }, 80);
+          } else {
+            clearPersistedBatch();
+          }
+        }
+      }
+    } catch {}
+  }, []);
+
+  function pruneHistory() {
+    const now = Date.now();
+    generationHistoryRef.current = generationHistoryRef.current.filter(ts => now - ts < 60_000);
+  }
+  function pushHistory(ts: number) {
+    generationHistoryRef.current.push(ts);
+    localStorage.setItem('reviewer.gen.history', JSON.stringify(generationHistoryRef.current));
+  }
+  function checkRateLimit(nextCount = 1): { ok: boolean; waitMs?: number } {
+    pruneHistory();
+    const now = Date.now();
+    if (generationHistoryRef.current.length + nextCount > 10) {
+      const oldest = Math.min(...generationHistoryRef.current);
+      const waitMs = 60_000 - (now - oldest);
+      return { ok: false, waitMs: Math.max(waitMs, 0) };
+    }
+    return { ok: true };
+  }
+
+  useEffect(()=>{
+    if (!cooldownUntil) return;
+    const id = setInterval(()=>{
+      if (cooldownUntil && Date.now() >= cooldownUntil) {
+        setCooldownUntil(null);
+      } else {
+        // 觸發 rerender
+        setGenStatus(s => s === '' ? '' : s);
+      }
+    }, 1000);
+    return ()=>clearInterval(id);
+  }, [cooldownUntil]);
+  // Gemini 設定
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(()=> localStorage.getItem('reviewer.gemini.apiKey') || '');
+  const [geminiModel, setGeminiModel] = useState<string>(()=> localStorage.getItem('reviewer.gemini.model') || 'gemini-2.5-flash');
   const loadedConfigRef = useRef(false);
 
   // 初始化從 localStorage 載入暫存文章
@@ -62,7 +159,8 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
       } catch {}
     }
     loadedConfigRef.current = true;
-    refreshList();
+  refreshList();
+  refreshUnreadList();
   }, []);
 
   // 保存設定
@@ -79,6 +177,14 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     };
     localStorage.setItem('reviewer.reader.config.v1', JSON.stringify(cfg));
   }, [totalWanted, overrideBox1, overrideBox2, overrideBox3, targetSentences, style, maxLength]);
+
+  // 保存 Gemini 設定
+  useEffect(()=>{
+    localStorage.setItem('reviewer.gemini.apiKey', geminiApiKey);
+  }, [geminiApiKey]);
+  useEffect(()=>{
+    localStorage.setItem('reviewer.gemini.model', geminiModel);
+  }, [geminiModel]);
 
   // 開發/暫時使用：可在 console 呼叫 window.setArticle('內容') 注入文章
   useEffect(() => {
@@ -138,13 +244,164 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   }
 
   async function runAI() {
-    if (!prompt.trim()) return;
+    setGenError('');
+    setGenStatus('抽樣中');
+    const res = sampleForLanguage(blocks, genLang, {
+      totalWanted,
+      overrideBox1: overrideBox1 === '' ? undefined : overrideBox1,
+      overrideBox2: overrideBox2 === '' ? undefined : overrideBox2,
+      overrideBox3: overrideBox3 === '' ? undefined : overrideBox3,
+    });
+    setLastSampleInfo(res.detail);
+    setLastLang(genLang);
+    const builtPrompt = buildBasePrompt({
+      lang: genLang,
+      blocks: res.selected.map(b=>({ id: b.id, text: b.text, box: b.box })),
+      targetSentences,
+      style: style || (genLang==='ja' ? '説明' : 'explanatory'),
+      maxLength
+    });
+    setPrompt(builtPrompt);
+    if (!res.selected.length) {
+      setGenError('沒有可用的單字/語法，無法生成');
+      setGenStatus('');
+      return;
+    }
     setGenerating(true);
+    setGenStatus('呼叫模型');
     try {
-      const result = await mockGenerateArticle(prompt);
-      setArticle(result.raw);
-      // 如果 AI 有提供 html，用 html 覆蓋 (此處 mock 沒有)
-    } finally { setGenerating(false); }
+      let raw=''; let html=''; let usedIds: string[] = [];
+      if (geminiApiKey) {
+        const result = await generateWithGemini({ apiKey: geminiApiKey, model: geminiModel, prompt: builtPrompt });
+        raw = result.raw || '';
+        html = result.html || raw;
+        if ((result as any).usedIds && Array.isArray((result as any).usedIds)) usedIds = (result as any).usedIds;
+        if (!usedIds.length) {
+          const matches = html.match(/data-item-id="(.*?)"/g) || [];
+          usedIds = Array.from(new Set(matches.map(s=>s.replace(/.*data-item-id="(.*)".*/, '$1'))));
+        }
+      } else {
+        const mock = await mockGenerateArticle(builtPrompt);
+        raw = mock.raw; html = mock.html || mock.raw;
+        usedIds = res.selected.map(b=>b.id);
+      }
+      setGenStatus('儲存中');
+      const art: Article = {
+        id: uuid(),
+        createdAt: Date.now(),
+        lang: genLang,
+        raw,
+        html,
+        usedBlockIds: usedIds.length ? usedIds : res.selected.map(b=>b.id)
+      };
+      await saveUnreadArticle(art);
+      await refreshUnreadList();
+  // 不立即顯示文章，只放入未讀列表
+      setGenStatus('完成');
+      setTimeout(()=>setGenStatus(''), 2500);
+    } catch (e:any) {
+      setGenError(e.message || String(e));
+      setGenStatus('失敗');
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function batchRunAI() {
+    setGenError('');
+    setBatchErrors([]);
+    const count = Math.min(Math.max(batchCount,1), 10);
+    // 檢查速率限制
+    pruneHistory();
+    const rl = checkRateLimit(count);
+    if (!rl.ok) {
+      const until = Date.now() + (rl.waitMs || 60_000);
+      setCooldownUntil(until);
+      setGenError(`超過每分鐘 10 篇限制，冷卻中，請等待 ${(Math.ceil((until - Date.now())/1000))} 秒`);
+      return;
+    }
+    setBatchRunning(true);
+    setBatchProgress(0);
+    cancelRef.current = false;
+  persistBatchState({ running:true, total:count, completed:0, startedAt: Date.now() });
+    for (let i=0;i<count;i++) {
+      if (cancelRef.current) break;
+      setGenStatus(`第 ${i+1}/${count} 篇`);
+      try {
+        await runAI(); // runAI 會自行儲存一篇
+        if (cancelRef.current) break;
+        pushHistory(Date.now());
+    setBatchProgress(p=> { const np = p+1; persistBatchState({ completed: np }); return np; });
+    pruneHistory();
+      } catch (e:any) {
+        setBatchErrors(errs=>[...errs, `第${i+1}篇: ${(e?.message)||String(e)}`]);
+      }
+      // 若途中超過 10 篇，啟動冷卻
+      const rl2 = checkRateLimit(0);
+      if (!rl2.ok) {
+        const until = Date.now() + (rl2.waitMs || 60_000);
+        setCooldownUntil(until);
+        setGenError('已達每分鐘 10 篇，進入冷卻');
+  persistBatchState({ cooldownUntil: until });
+        break;
+      }
+    }
+    setGenStatus('');
+    setBatchRunning(false);
+    cancelRef.current = false;
+    clearPersistedBatch();
+  }
+
+  // 重新啟動後續跑的批次
+  async function resumeBatch(remaining: number, originalTotal: number) {
+    cancelRef.current = false;
+    for (let i=0;i<remaining;i++) {
+      if (cancelRef.current) break;
+      const already = batchProgress + i;
+      setGenStatus(`第 ${already+1}/${originalTotal} 篇`);
+      try {
+        await runAI();
+        if (cancelRef.current) break;
+        pushHistory(Date.now());
+        setBatchProgress(p=> { const np = p+1; persistBatchState({ running:true, total: originalTotal, completed: np }); return np; });
+        pruneHistory();
+      } catch (e:any) {
+        setBatchErrors(errs=>[...errs, `第${already+1}篇: ${(e?.message)||String(e)}`]);
+      }
+      const rl2 = checkRateLimit(0);
+      if (!rl2.ok) {
+        const until = Date.now() + (rl2.waitMs || 60_000);
+        setCooldownUntil(until);
+        setGenError('已達每分鐘 10 篇，進入冷卻');
+        persistBatchState({ cooldownUntil: until });
+        break;
+      }
+    }
+    setGenStatus('');
+    setBatchRunning(false);
+    cancelRef.current = false;
+    clearPersistedBatch();
+  }
+
+  // 讀取最舊未讀文章並顯示：刪除目前文章內容，載入最舊一篇
+  async function loadOldestUnreadAndReplace() {
+  const list = unreadArticles.filter(a=>a.lang===loadLang);
+  if (!list.length) return;
+  // list 是所有選定語言的文章，新->舊排序，所以 oldest 為 createdAt 最小
+  const oldest = list.reduce((acc, cur)=> cur.createdAt < acc.createdAt ? cur : acc, list[0]);
+    const full = await getUnreadArticle(oldest.id);
+    if (full) {
+      setArticle(full.raw);
+      setLastSavedId(null);
+      const lang = full.lang || detectLangFromContent(full.raw);
+      if (lang === 'ja' || lang === 'en') {
+        setLastLang(lang);
+        localStorage.setItem('reviewer.lastLang', lang);
+      }
+      // 使用後可選擇是否從未讀刪除：這裡依需求移除
+      await deleteUnreadArticle(full.id);
+      await refreshUnreadList();
+    }
   }
   const dictByBox = useMemo(() => {
     return {
@@ -246,12 +503,34 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     }
   }
 
+  async function addCurrentToUnread() {
+    if (!article.trim()) return;
+    const art: Article = {
+      id: uuid(),
+      createdAt: Date.now(),
+      lang: detectLangFromContent(article),
+      raw: article,
+      html: highlighted,
+      usedBlockIds: usedIds,
+    };
+    await saveUnreadArticle(art);
+    await refreshUnreadList();
+  }
+
   async function refreshList() {
     setLoadingList(true);
     try {
       const list = await listArticles(30);
       setArticles(list);
     } finally { setLoadingList(false); }
+  }
+
+  async function refreshUnreadList() {
+    setLoadingUnreadList(true);
+    try {
+      const list = await listUnreadArticles(50);
+      setUnreadArticles(list);
+    } finally { setLoadingUnreadList(false); }
   }
 
   async function loadArticle(id: string) {
@@ -266,14 +545,47 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     } finally { setLoadingArticleId(null); }
   }
 
+  async function loadUnreadArticle(id: string) {
+    setLoadingUnreadArticleId(id);
+    try {
+      const a = await getUnreadArticle(id);
+      if (a) {
+        setArticle(a.raw);
+        setLastSavedId(null);
+        // 更新語言以觸發下方使用詞彙 box 切換
+        const lang = a.lang || detectLangFromContent(a.raw);
+        if (lang === 'ja' || lang === 'en') {
+          setLastLang(lang);
+          localStorage.setItem('reviewer.lastLang', lang);
+        }
+        // 載入後自動從未讀移除
+        await deleteUnreadArticle(a.id);
+        await refreshUnreadList();
+      }
+    } finally { setLoadingUnreadArticleId(null); }
+  }
+
   async function removeArticle(id: string) {
     await deleteArticle(id);
     if (lastSavedId === id) setLastSavedId(null);
     await refreshList();
   }
 
+  async function removeUnreadArticle(id: string) {
+    await deleteUnreadArticle(id);
+    await refreshUnreadList();
+  }
+
   function toggleSelect(id: string) {
     setSelectedIds(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  }
+
+  function toggleSelectUnread(id: string) {
+    setSelectedUnreadIds(prev => {
       const n = new Set(prev);
       if (n.has(id)) n.delete(id); else n.add(id);
       return n;
@@ -285,6 +597,11 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     setSelectedIds(new Set());
   }
 
+  function exitSelectUnreadMode() {
+    setSelectUnreadMode(false);
+    setSelectedUnreadIds(new Set());
+  }
+
   async function bulkDeleteSelected() {
     const ids = Array.from(selectedIds);
     await deleteArticles(ids);
@@ -293,11 +610,24 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     await refreshList();
   }
 
+  async function bulkDeleteSelectedUnread() {
+    const ids = Array.from(selectedUnreadIds);
+    await deleteUnreadArticles(ids);
+    exitSelectUnreadMode();
+    await refreshUnreadList();
+  }
+
   async function deleteAllArticles() {
     await clearAllArticles();
     if (lastSavedId) setLastSavedId(null);
     exitSelectMode();
     await refreshList();
+  }
+
+  async function deleteAllUnreadArticles() {
+    await clearAllUnreadArticles();
+    exitSelectUnreadMode();
+    await refreshUnreadList();
   }
 
   return (
@@ -308,6 +638,27 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
           <summary style={{ cursor:'pointer', fontWeight:600 }}>Prompt (可編輯)</summary>
           <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} style={{ width:'100%', minHeight:160, marginTop:8, fontFamily:'monospace', fontSize:12 }} />
           {lastLang && <div className="hint" style={{ marginTop:4 }}>目前語言: {lastLang}</div>}
+          <div style={{ marginTop:12, display:'flex', flexDirection:'column', gap:8 }}>
+            <label style={{ fontSize:12 }}>Gemini API Key
+              <input type="password" value={geminiApiKey} placeholder="輸入後會保存在本機" onChange={e=>setGeminiApiKey(e.target.value.trim())} style={{ width:'100%', marginTop:4 }} />
+            </label>
+            <label style={{ fontSize:12 }}>Gemini 模型
+              <select value={geminiModel} onChange={e=>setGeminiModel(e.target.value)} style={{ width:'100%', marginTop:4 }}>
+                <option value="gemini-2.5-pro">gemini-2.5-pro (精準/推理)</option>
+                <option value="gemini-2.5-flash">gemini-2.5-flash (速度/性價比)</option>
+                <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (更低延遲與成本)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash (穩定版 2.0 flash)</option>
+                <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
+                <option value="gemini-2.0-flash-live-001">gemini-2.0-flash-live-001 (Live / 可能非必要)</option>
+                <option value="gemini-2.5-flash-preview-tts">gemini-2.5-flash-preview-tts (TTS 預覽)</option>
+                <option value="gemini-2.5-pro-preview-tts">gemini-2.5-pro-preview-tts (TTS Pro)</option>
+                <option value="gemini-1.5-flash">gemini-1.5-flash (Deprecated)</option>
+                <option value="gemini-1.5-flash-8b">gemini-1.5-flash-8b (Deprecated)</option>
+                <option value="gemini-1.5-pro">gemini-1.5-pro (Deprecated)</option>
+              </select>
+            </label>
+            {!geminiApiKey && <div className="hint" style={{ fontSize:11, color:'#dc2626' }}>未填 API Key，會使用本地 mock 生成。</div>}
+          </div>
         </details>
         <details style={{ marginBottom: 12 }}>
           <summary style={{ cursor:'pointer', fontWeight:600 }}>已保存文章 ({loadingList?'載入中...':articles.length})</summary>
@@ -334,6 +685,44 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
             ))}
           </ul>
         </details>
+        <details style={{ marginBottom: 12 }}>
+          <summary style={{ cursor:'pointer', fontWeight:600 }}>未讀的文章 ({loadingUnreadList?'載入中...':unreadArticles.length})</summary>
+          <div style={{ display:'flex', gap:8, flexWrap:'wrap', margin:'8px 0' }}>
+            {!selectUnreadMode && <button type="button" disabled={!unreadArticles.length} onClick={()=>setSelectUnreadMode(true)}>選取刪除</button>}
+            {selectUnreadMode && <>
+              <button type="button" onClick={exitSelectUnreadMode}>取消</button>
+              <button type="button" disabled={!selectedUnreadIds.size} onClick={bulkDeleteSelectedUnread}>刪除已選({selectedUnreadIds.size})</button>
+              <button type="button" onClick={()=>setSelectedUnreadIds(new Set(unreadArticles.map(a=>a.id)))}>全選</button>
+            </>}
+            <button type="button" disabled={!unreadArticles.length} onClick={deleteAllUnreadArticles}>全部清除</button>
+          </div>
+          {unreadArticles.length === 0 && !loadingUnreadList && <div className="hint" style={{ padding:'4px 0' }}>尚無未讀文章</div>}
+          {unreadArticles.length>0 && (
+            <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+              {(['ja','en'] as const).map(lang => {
+                const list = unreadArticles.filter(a=>a.lang===lang);
+                return (
+                  <div key={lang} style={{ flex:'1 1 280px', minWidth:260 }}>
+                    <h4 style={{ margin:'4px 0 4px', fontSize:13 }}>{lang==='ja'?'日文未讀':'英文未讀'} ({list.length})</h4>
+                    <ul style={{ listStyle:'none', margin:4, padding:0, display:'flex', flexDirection:'column', gap:4, maxHeight:200, overflow:'auto', border:'1px solid var(--border)', borderRadius:4, paddingTop:4 }}>
+                      {list.map(a => (
+                        <li key={a.id} style={{ display:'flex', alignItems:'center', gap:8, fontSize:12, background: selectUnreadMode && selectedUnreadIds.has(a.id)? '#e0f2fe':'transparent', padding:'2px 6px', borderRadius:4 }}>
+                          {selectUnreadMode && (
+                            <input type="checkbox" checked={selectedUnreadIds.has(a.id)} onChange={()=>toggleSelectUnread(a.id)} />
+                          )}
+                          <button style={{ padding:'2px 6px', background:'#fff', color:'#111', border:'1px solid var(--border)' }} disabled={loadingUnreadArticleId===a.id} onClick={()=>loadUnreadArticle(a.id)}>載入</button>
+                          <span style={{ flex:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{new Date(a.createdAt).toLocaleString()} · {a.raw.slice(0,34).replace(/\n/g,' ')}{a.raw.length>34?'…':''}</span>
+                          {!selectUnreadMode && <button style={{ background:'#dc2626' }} onClick={()=>removeUnreadArticle(a.id)}>刪除</button>}
+                        </li>
+                      ))}
+                      {!list.length && <li className="hint" style={{ fontSize:11, color:'var(--muted)', padding:'2px 6px' }}>無</li>}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </details>
         <h2 style={{ marginBottom: 4 }}>AI 文章閱讀</h2>
         <div className="legend hint" style={{ marginBottom: 12 }}>
           顏色：{boxLabels.box1}=紅、{boxLabels.box2}=橙、{boxLabels.box3}=綠
@@ -341,10 +730,42 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
         <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:12 }}>
           <button type="button" onClick={()=>generateMock('ja')}>假生成（日文）</button>
           <button type="button" onClick={()=>generateMock('en')}>假生成（英文）</button>
-          <button type="button" disabled={!prompt || generating} onClick={runAI}>{generating ? '生成中...' : '用 AI 生成'}</button>
+          <label style={{ display:'flex', alignItems:'center', gap:4, fontSize:12 }}>語言
+            <select value={genLang} onChange={e=>setGenLang(e.target.value as any)} style={{ padding:'2px 4px' }}>
+              <option value="ja">日文</option>
+              <option value="en">英文</option>
+            </select>
+          </label>
+          <label style={{ fontSize:12 }}>批次
+            <input type="number" min={1} max={10} value={batchCount} onChange={e=>setBatchCount(Math.min(10, Math.max(1, Number(e.target.value)||1)))} style={{ width:60, marginLeft:4 }} />
+          </label>
+          <button type="button" disabled={generating || batchRunning || (!!cooldownUntil && Date.now()<cooldownUntil)} onClick={runAI}>{generating ? '生成中...' : '生成 1 篇'}</button>
+          <button type="button" disabled={generating || batchRunning || (!!cooldownUntil && Date.now()<cooldownUntil)} onClick={batchRunAI}>{batchRunning ? '批次進行中' : `批次生成(${batchCount})`}</button>
+          {batchRunning && <button type="button" onClick={()=>{cancelRef.current=true; setGenStatus('取消中'); clearPersistedBatch();}} style={{ background:'#dc2626' }}>取消</button>}
           <button type="button" disabled={!article || saving} onClick={onSaveArticle}>{saving ? '保存中...' : '保存文章'}</button>
           {lastSavedId && <span className="hint">已保存</span>}
+          {genStatus && <span className="hint" style={{ minWidth:60 }}>{genStatus}</span>}
+          {genError && <span className="hint" style={{ color:'#dc2626' }}>錯誤: {genError}</span>}
+          {cooldownUntil && Date.now()<cooldownUntil && (
+            <span className="hint" style={{ color:'#f59e0b' }}>冷卻 {Math.ceil((cooldownUntil-Date.now())/1000)}s</span>
+          )}
         </div>
+        {(generating || batchRunning) && (
+          <div style={{ width:'100%', marginBottom:12 }}>
+            <div style={{ position:'relative', height:6, background:'#eee', borderRadius:4, overflow:'hidden' }}>
+              <div style={{ position:'absolute', left:0, top:0, bottom:0, width: batchRunning? `${(batchProgress/Math.max(batchCount,1))*100}%` : '100%', background:'#3b82f6', transition:'width .3s' }} />
+            </div>
+            {batchRunning && <div style={{ fontSize:11, marginTop:4 }}>進度 {batchProgress}/{batchCount}</div>}
+          </div>
+        )}
+        {batchErrors.length>0 && (
+          <details style={{ marginBottom:12 }} open>
+            <summary style={{ fontSize:12, cursor:'pointer' }}>批次錯誤 ({batchErrors.length})</summary>
+            <ul style={{ margin:4, paddingLeft:18, fontSize:11, color:'#dc2626' }}>
+              {batchErrors.map((e,i)=><li key={i}>{e}</li>)}
+            </ul>
+          </details>
+        )}
         <div className="hint" style={{ display:'flex', flexWrap:'wrap', gap:8, fontSize:12, marginBottom:12 }}>
           <label>總數 <input type="number" value={totalWanted} min={1} style={{ width:60 }} onChange={e=>setTotalWanted(Number(e.target.value)||1)} /></label>
           <label>box1 <input type="number" value={overrideBox1} placeholder="4" style={{ width:50 }} onChange={e=>setOverrideBox1(e.target.value===''?'':Number(e.target.value))} /></label>
@@ -363,6 +784,16 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
             </select>
           </label>
           <label>MaxLen <input type="number" value={maxLength} min={100} style={{ width:70 }} onChange={e=>setMaxLength(Number(e.target.value)||500)} /></label>
+        </div>
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:12 }}>
+          <button type="button" onClick={loadOldestUnreadAndReplace} disabled={!unreadArticles.some(a=>a.lang===loadLang)}>重新整理並導入一篇新文章</button>
+          <label style={{ display:'flex', alignItems:'center', gap:4, fontSize:12 }}>
+            <select value={loadLang} onChange={e=>{ const v=e.target.value==='en'?'en':'ja'; setLoadLang(v); localStorage.setItem('reviewer.loadLang', v); }}>
+              <option value="ja">日文</option>
+              <option value="en">英文</option>
+            </select>
+          </label>
+          <button type="button" disabled={!article} onClick={addCurrentToUnread}>返回未讀</button>
         </div>
   {/* Prompt 區塊已上移並預設收起 */}
         {lastSampleInfo && <details className="hint" style={{ marginBottom:12 }}>

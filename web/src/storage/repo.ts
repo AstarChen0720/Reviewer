@@ -58,3 +58,29 @@ export async function deleteArticles(ids: string[]) {
 export async function clearAllArticles() {
   await db.articles.clear();
 }
+
+// Unread Articles (AI generated, not yet formally saved by user)
+export async function saveUnreadArticle(article: Article) {
+  await db.unreadArticles.put(article);
+}
+
+export async function listUnreadArticles(limit = 50): Promise<Article[]> {
+  return db.unreadArticles.orderBy('createdAt').reverse().limit(limit).toArray();
+}
+
+export async function getUnreadArticle(id: string): Promise<Article | undefined> {
+  return db.unreadArticles.get(id);
+}
+
+export async function deleteUnreadArticle(id: string) {
+  await db.unreadArticles.delete(id);
+}
+
+export async function deleteUnreadArticles(ids: string[]) {
+  if (!ids.length) return;
+  await db.unreadArticles.bulkDelete(ids);
+}
+
+export async function clearAllUnreadArticles() {
+  await db.unreadArticles.clear();
+}

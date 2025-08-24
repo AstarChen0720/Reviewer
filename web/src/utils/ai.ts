@@ -27,6 +27,65 @@ export async function mockGenerateArticle(prompt: string): Promise<AIGenerateRes
   return { raw };
 }
 
+// Gemini API 呼叫
+// 只做最基本的 JSON 輸出抽取，容錯: 若模型包成```或前後多餘文字，嘗試擷取第一個 { ... } JSON。
+export async function generateWithGemini(params: { apiKey: string; model: string; prompt: string }): Promise<AIGenerateResult & { usedIds?: string[] }> {
+  const { apiKey, model, prompt } = params;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const body = {
+    contents: [
+      { role: 'user', parts: [{ text: prompt }]} as any
+    ],
+    generationConfig: {
+      // 讓模型專注輸出 JSON，不特別調溫度 (可再加參數)
+      temperature: 0.7,
+    }
+  };
+  let text = '';
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${errTxt}`);
+    }
+    const data = await res.json();
+    // 典型結構: data.candidates[0].content.parts[].text
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+      text = parts.map((p: any) => p.text || '').join('\n');
+    } else {
+      text = JSON.stringify(data);
+    }
+  } catch (e: any) {
+    return { raw: `Gemini API 調用失敗: ${e.message || e}` };
+  }
+  // 嘗試萃取 JSON
+  let jsonStr = text.trim();
+  // 移除 ```json ``` 包裹
+  if (jsonStr.startsWith('```')) {
+    jsonStr = jsonStr.replace(/^```[a-zA-Z]*\n?/, '').replace(/```$/, '').trim();
+  }
+  if (!jsonStr.startsWith('{')) {
+    // 嘗試抓第一個 { ... } 區塊
+    const m = jsonStr.match(/\{[\s\S]*\}/);
+    if (m) jsonStr = m[0];
+  }
+  try {
+    const parsed = JSON.parse(jsonStr);
+    const raw = typeof parsed.raw === 'string' ? parsed.raw : (parsed.text || text);
+    const html = typeof parsed.html === 'string' ? parsed.html : undefined;
+    const usedIds: string[] | undefined = Array.isArray(parsed.usedIds) ? parsed.usedIds.filter((x: any)=>typeof x==='string') : undefined;
+    return { raw, html, usedIds };
+  } catch {
+    // 解析失敗: 直接回傳原始文字
+    return { raw: text };
+  }
+}
+
 export function buildBasePrompt(params: {
   lang: 'ja'|'en';
   blocks: { id: string; text: string; box: string }[];
