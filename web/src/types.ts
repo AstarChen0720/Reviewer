@@ -7,6 +7,8 @@ export type Block = {
   kind: 'vocab' | 'grammar' | 'unknown';
   box: Box;
   position: number;
+  updatedAt?: number; // 本地最後更新時間 (ms)
+  deleted?: boolean;  // 軟刪除標記供同步
 };
 
 export type Article = {
@@ -16,5 +18,7 @@ export type Article = {
   raw: string; // 原始文字
   html: string; // 高亮後 HTML
   usedBlockIds: string[]; // 有出現在文章中的 block id
+  updatedAt?: number;
+  deleted?: boolean;
 };
 

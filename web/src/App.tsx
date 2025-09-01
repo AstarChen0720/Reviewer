@@ -9,6 +9,9 @@ import { splitToBlocks } from './utils/split';
 import { db } from './storage/db';
 import { getAllByBox, bulkAdd, upsert, clearAll as clearAllDB } from './storage/repo';
 import { Reader } from './components/Reader';
+import { supabase } from './shims/supabaseClient';
+import { syncAll, pullAll, syncState } from './storage/sync';
+import { initRealtime } from './realtime';
 
 const boxes: Box[] = ['stash', 'box1', 'box2', 'box3', 'trash'];
 export const boxLabels: Record<Box, string> = {
@@ -27,6 +30,45 @@ export default function App() {
   const [search, setSearch] = useState<{[k in Box]?: string}>({});
   const [trashSelectMode, setTrashSelectMode] = useState(false);
   const [selectedTrashIds, setSelectedTrashIds] = useState<Set<string>>(new Set());
+  // auth & sync
+  const [userEmail, setUserEmail] = useState('');
+  const [userPass, setUserPass] = useState('');
+  const [sessionUser, setSessionUser] = useState<any>(null);
+  const [authMsg, setAuthMsg] = useState('');
+  const [, forceTick] = useState(0); // to refresh sync status UI
+
+  useEffect(()=> {
+    supabase.auth.getUser().then((r:any)=> setSessionUser(r.data.user||null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e: any, sess: any)=> {
+      setSessionUser(sess?.user||null);
+    });
+    const t = setInterval(()=> forceTick(x=>x+1), 1000);
+    return ()=> { sub.subscription.unsubscribe(); clearInterval(t); };
+  }, []);
+
+  // Realtime attach when user present
+  useEffect(()=> {
+    if (!sessionUser) return;
+    const dispose = initRealtime(sessionUser.id, () => { refreshBlocks(); });
+    return () => { dispose && dispose(); };
+  }, [sessionUser]);
+
+  async function loginOrRegister() {
+    setAuthMsg('');
+    if (!userEmail || !userPass) { setAuthMsg('輸入 email & 密碼'); return; }
+    const { data, error } = await supabase.auth.signInWithPassword({ email: userEmail, password: userPass });
+    if (data.user) { setAuthMsg('登入成功'); await pullAll(true); refreshBlocks(); return; }
+    if (error) {
+      if (error.message.toLowerCase().includes('invalid')) {
+        const { data: reg, error: regErr } = await supabase.auth.signUp({ email: userEmail, password: userPass });
+        if (regErr) { setAuthMsg('註冊失敗: '+regErr.message); return; }
+        if (reg.user) { setAuthMsg('註冊完成 (若需驗證請查收)'); await pullAll(true); refreshBlocks(); }
+      } else setAuthMsg(error.message);
+    }
+  }
+  async function logout() { await supabase.auth.signOut(); setAuthMsg(''); }
+  async function doSync() { try { await syncAll(); refreshBlocks(); } catch(e:any){ setAuthMsg(e.message||String(e)); } }
+  async function refreshBlocks() { const grouped = await getAllByBox(); setBlocks([ ...grouped.stash, ...grouped.box1, ...grouped.box2, ...grouped.box3, ...grouped.trash ]); }
 
   // 初始讀取：先嘗試把 localStorage 舊資料搬到 Dexie（一次性）
   useEffect(() => {
@@ -278,7 +320,27 @@ export default function App() {
     <div>
     <header className="topbar">
         <h1>Reviewer</h1>
-        <div className="actions">
+        <div className="actions" style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+          {sessionUser ? (
+            <>
+              <span style={{ fontSize:12 }}>{sessionUser.email} <code style={{ fontSize:10, opacity:.6 }}>{sessionUser.id.slice(0,8)}</code></span>
+              <button onClick={doSync} disabled={syncState.pushing || syncState.pulling}>{syncState.pushing||syncState.pulling? '同步中...' : '同步'}</button>
+              <button onClick={logout}>登出</button>
+              <span style={{ fontSize:11, color: syncState.error? '#dc2626':'#16a34a' }}>
+                {syncState.error ? '錯誤' : `P:${Math.floor((Date.now()-syncState.lastPull)/1000)}s`}
+              </span>
+            </>
+          ) : (
+            <details>
+              <summary style={{ cursor:'pointer' }}>登入/註冊</summary>
+              <div style={{ position:'absolute', right:8, top:'56px', background:'#fff', border:'1px solid #ddd', padding:8, borderRadius:6, display:'flex', flexDirection:'column', gap:4, width:220 }}>
+                <input placeholder="Email" value={userEmail} onChange={e=>setUserEmail(e.target.value)} />
+                <input placeholder="Password" type="password" value={userPass} onChange={e=>setUserPass(e.target.value)} />
+                <button type="button" onClick={loginOrRegister}>送出</button>
+                {authMsg && <div style={{ fontSize:11, color:'#555' }}>{authMsg}</div>}
+              </div>
+            </details>
+          )}
           <button className={view==='board'? 'active': ''} onClick={() => setView('board')}>編輯</button>
           <button className={view==='reader'? 'active': ''} onClick={() => setView('reader')}>閱讀高亮</button>
           <button onClick={exportJSON}>匯出 JSON</button>

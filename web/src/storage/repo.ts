@@ -1,5 +1,25 @@
 import { db } from './db';
 import type { Block, Box, Article } from '../types';
+import { schedulePush } from './sync';
+
+// --------------------
+// Dirty queue (localStorage) for sync
+// --------------------
+type DirtyKinds = 'items' | 'articles' | 'unreadArticles' | 'settings' | 'magicItems' | 'states';
+function getDirty(): Record<string, string[]> {
+  try { return JSON.parse(localStorage.getItem('reviewer.sync.dirty') || '{}'); } catch { return {}; }
+}
+function setDirty(obj: Record<string,string[]>) {
+  localStorage.setItem('reviewer.sync.dirty', JSON.stringify(obj));
+}
+function markDirty(kind: DirtyKinds, ids: string[]) {
+  if (!ids.length) return;
+  const cur = getDirty();
+  cur[kind] = Array.from(new Set([...(cur[kind]||[]), ...ids]));
+  setDirty(cur);
+  // debounce auto push
+  schedulePush();
+}
 
 // --------------------
 // Migration from legacy localStorage keys to IndexedDB (one-time)
@@ -100,15 +120,21 @@ export async function getAllByBox(): Promise<Record<Box, Block[]>> {
 }
 
 export async function bulkAdd(blocks: Block[]) {
+  const ts = Date.now();
+  blocks.forEach(b => { if (!b.updatedAt) b.updatedAt = ts; });
   await db.items.bulkAdd(blocks);
+  markDirty('items', blocks.map(b=>b.id));
 }
 
 export async function upsert(block: Block) {
-  await db.items.put(block);
+  const updated = { ...block, updatedAt: Date.now() };
+  await db.items.put(updated);
+  markDirty('items', [updated.id]);
 }
 
 export async function remove(id: string) {
   await db.items.delete(id);
+  // record deletion as tombstone? For now rely on not existing; skip.
 }
 
 export async function clearAll() {
@@ -117,7 +143,9 @@ export async function clearAll() {
 
 // Articles
 export async function saveArticle(article: Article) {
-  await db.articles.put(article);
+  const updated = { ...article, updatedAt: Date.now() };
+  await db.articles.put(updated);
+  markDirty('articles', [updated.id]);
 }
 
 export async function listArticles(limit = 20): Promise<Article[]> {
@@ -151,7 +179,8 @@ export async function clearAllArticles() {
 
 // Unread Articles (AI generated, not yet formally saved by user)
 export async function saveUnreadArticle(article: Article) {
-  await db.unreadArticles.put(article);
+  const updated = { ...article, updatedAt: Date.now() };
+  await db.unreadArticles.put(updated);
 }
 
 export async function listUnreadArticles(limit = 50): Promise<Article[]> {
