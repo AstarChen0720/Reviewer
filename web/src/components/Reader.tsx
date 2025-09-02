@@ -4,7 +4,7 @@ import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { DraggableItem } from './DraggableItem';
 import type { Block, Article } from '../types';
 import { boxLabels } from '../App';
-import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles, listUnreadArticles, getUnreadArticle, saveUnreadArticle, deleteUnreadArticle, deleteUnreadArticles, clearAllUnreadArticles } from '../storage/repo';
+import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles, listUnreadArticles, getUnreadArticle, saveUnreadArticle, deleteUnreadArticle, deleteUnreadArticles, clearAllUnreadArticles, getState, setState } from '../storage/repo';
 import { uuid } from '../utils/split';
 import { sampleForLanguage } from '../utils/sampleBlocks';
 import { buildBasePrompt, mockGenerateArticle, generateWithGemini } from '../utils/ai';
@@ -267,10 +267,27 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
 
   // 初始化從 localStorage 載入暫存文章
   useEffect(() => {
-    const raw = localStorage.getItem('reviewer.currentArticle.v1');
-    if (raw) setArticle(raw);
-    const storedLang = localStorage.getItem('reviewer.lastLang');
-    if (storedLang === 'ja' || storedLang === 'en') setLastLang(storedLang);
+    // Step17: 先嘗試從 Dexie states 載入 currentArticle
+    (async () => {
+      try {
+        const dexieRaw = await getState('currentArticleRaw');
+        const dexieLang = await getState('currentArticleLang');
+        if (dexieRaw) setArticle(dexieRaw);
+        if (dexieLang === 'ja' || dexieLang === 'en') setLastLang(dexieLang as any);
+        // 若 Dexie 沒有，執行一次從 localStorage 的遷移（舊資料 → Dexie）
+        if (!dexieRaw) {
+          const legacyRaw = localStorage.getItem('reviewer.currentArticle.v1');
+          if (legacyRaw) { setArticle(legacyRaw); setState('currentArticleRaw', legacyRaw).catch(()=>{}); }
+        }
+        if (!dexieLang) {
+          const legacyLang = localStorage.getItem('reviewer.lastLang');
+            if (legacyLang === 'ja' || legacyLang === 'en') {
+              setLastLang(legacyLang as any);
+              setState('currentArticleLang', legacyLang).catch(()=>{});
+            }
+        }
+      } catch {}
+    })();
     // 載入參數設定
     const cfgRaw = localStorage.getItem('reviewer.reader.config.v1');
     if (cfgRaw) {
@@ -319,10 +336,19 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     return () => { delete (window as any).setArticle; };
   }, []);
 
-  // 寫入暫存
+  // Step17: 文章變更 -> 寫入 Dexie states（同時維持舊 localStorage 以備回退）
   useEffect(() => {
-    if (article) localStorage.setItem('reviewer.currentArticle.v1', article);
-    else localStorage.removeItem('reviewer.currentArticle.v1');
+    (async () => {
+      try {
+        if (article) {
+          await setState('currentArticleRaw', article);
+          localStorage.setItem('reviewer.currentArticle.v1', article); // 兼容舊版本
+        } else {
+          await setState('currentArticleRaw', '');
+          localStorage.removeItem('reviewer.currentArticle.v1');
+        }
+      } catch {}
+    })();
   }, [article]);
 
 
@@ -608,6 +634,7 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
       if (detected === 'ja' || detected === 'en') {
         setLastLang(detected);
         localStorage.setItem('reviewer.lastLang', detected);
+        setState('currentArticleLang', detected).catch(()=>{});
       }
     }
   }, [article, usedIds, lastLang]);
