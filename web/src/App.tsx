@@ -47,6 +47,7 @@ export default function App() {
       if (prevId && nextId && prevId !== nextId) {
         (async () => {
           await wipeAllLocalData();
+          if (typeof window !== 'undefined') window.dispatchEvent(new Event('reviewer-wiped'));
           setBlocks([]);
         })();
       }
@@ -65,7 +66,13 @@ export default function App() {
         })();
       }
       if (prevId && !nextId) {
-        // 登出：暫時保留本地？需求：離線練習可延續；不清除
+        // 登出：為避免下個使用者誤看到資料，直接清空本地
+        (async () => {
+          await wipeAllLocalData();
+          if (typeof window !== 'undefined') window.dispatchEvent(new Event('reviewer-wiped'));
+          setBlocks([]);
+          try { localStorage.removeItem('reviewer.lastUserId'); } catch {}
+        })();
       }
       setSessionUser(nextUser);
     });
@@ -93,7 +100,16 @@ export default function App() {
       } else setAuthMsg(error.message);
     }
   }
-  async function logout() { await supabase.auth.signOut(); setAuthMsg(''); }
+  async function logout() {
+    // 先清空本地資料，避免登出後仍看到上一帳號資料
+  await wipeAllLocalData();
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('reviewer-wiped'));
+    setBlocks([]);
+    try { localStorage.removeItem('reviewer.lastUserId'); } catch {}
+    await supabase.auth.signOut();
+    setSessionUser(null);
+    setAuthMsg('');
+  }
   async function doSync() { try { await syncAll(); refreshBlocks(); } catch(e:any){ setAuthMsg(e.message||String(e)); } }
   async function refreshBlocks() { const grouped = await getAllByBox(); setBlocks([ ...grouped.stash, ...grouped.box1, ...grouped.box2, ...grouped.box3, ...grouped.trash ]); }
 
@@ -473,7 +489,7 @@ export default function App() {
         </DndContext>
       </main>
       ) : (
-  <Reader blocks={blocks} moveBlockToBox={moveBlockToBox} />
+  <Reader userId={sessionUser?.id} blocks={blocks} moveBlockToBox={moveBlockToBox} />
       )}
     </div>
   );

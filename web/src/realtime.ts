@@ -55,9 +55,69 @@ export function initRealtime(userId: string, onRemoteChange: ()=>void) {
     })
     .subscribe();
 
+  // unread_articles realtime
+  const unreadChannel = supabase.channel('realtime:public:unread_articles')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'unread_articles', filter: `user_id=eq.${userId}` }, async (payload: ChangePayload) => {
+      const row = (payload.new || payload.old) as any;
+      if (!row?.id) return;
+      const remoteTs = isoToMs(row.updated_at);
+      if (payload.eventType === 'DELETE' || row.deleted) {
+        await db.unreadArticles.delete(row.id);
+        schedule();
+        return;
+      }
+      const local = await db.unreadArticles.get(row.id);
+      const localTs = local?.updatedAt || 0;
+      if (!local || remoteTs > localTs) {
+        const art: Article = { id: row.id, createdAt: isoToMs(row.created_at) || Date.now(), lang: row.lang, raw: row.raw, html: row.html, usedBlockIds: row.used_block_ids || [], updatedAt: remoteTs, deleted: row.deleted };
+        await db.unreadArticles.put(art);
+        schedule();
+      }
+    })
+    .subscribe();
+
+  // magic_items realtime
+  const magicChannel = supabase.channel('realtime:public:magic_items')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'magic_items', filter: `user_id=eq.${userId}` }, async (payload: ChangePayload) => {
+      const row = (payload.new || payload.old) as any;
+      if (!row?.id) return;
+      const remoteTs = isoToMs(row.updated_at);
+      if (payload.eventType === 'DELETE' || row.deleted) {
+        await db.magicItems.delete(row.id);
+        schedule();
+        return;
+      }
+      const local = await db.magicItems.get(row.id);
+      const localTs = local?.updatedAt || 0;
+      if (!local || remoteTs > localTs) {
+        const magic = { id: row.id, sourceBlockId: row.source_block_id, text: row.text, lang: row.lang, box: row.box, addedAt: isoToMs(row.added_at) || Date.now(), copied: row.copied, updatedAt: remoteTs, deleted: row.deleted };
+        await db.magicItems.put(magic);
+        schedule();
+      }
+    })
+    .subscribe();
+
+  // user_settings realtime (單行，更新時同步到本地 settings key)
+  const settingsChannel = supabase.channel('realtime:public:user_settings')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'user_settings', filter: `user_id=eq.${userId}` }, async (payload: ChangePayload) => {
+      const row = (payload.new || payload.old) as any;
+      if (!row) return;
+      const remoteTs = isoToMs(row.updated_at);
+      const local = await db.settings.get('settings');
+      const localTs = local?.updatedAt || 0;
+      if (!local || remoteTs > localTs) {
+        await db.settings.put({ key: 'settings', value: row.data || {}, updatedAt: remoteTs });
+        schedule();
+      }
+    })
+    .subscribe();
+
   return () => {
     supabase.removeChannel(itemsChannel);
     supabase.removeChannel(articlesChannel);
+    supabase.removeChannel(unreadChannel);
+    supabase.removeChannel(magicChannel);
+  supabase.removeChannel(settingsChannel);
     if (debounceTimer) clearTimeout(debounceTimer);
   };
 }

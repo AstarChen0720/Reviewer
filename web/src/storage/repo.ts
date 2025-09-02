@@ -208,5 +208,21 @@ export async function wipeAllLocalData() {
   try {
     localStorage.removeItem('reviewer.sync.dirty');
     localStorage.removeItem('reviewer.sync.meta');
+    // 移除所有舊的 per-user 設定 / 狀態 / magic bag key，避免跨帳號殘留
+    const legacyKeys = [
+      'reviewer.reader.config.v1',
+      'reviewer.magicBag.v1',
+      'reviewer.magicBag.filter',
+      'reviewer.magicBag.order',
+      'reviewer.magicBag.includeCopied',
+      'reviewer.gen.history',
+      'reviewer.batch.v1',
+      'reviewer.currentArticle.v1',
+      'reviewer.lastLang',
+      'reviewer.loadLang',
+      'reviewer.gemini.model',
+      'reviewer.gemini.apiKey'
+    ];
+    for (const k of legacyKeys) localStorage.removeItem(k);
   } catch {}
 }

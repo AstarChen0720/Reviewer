@@ -4,7 +4,7 @@ import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { DraggableItem } from './DraggableItem';
 import type { Block, Article } from '../types';
 import { boxLabels } from '../App';
-import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles, listUnreadArticles, getUnreadArticle, saveUnreadArticle, deleteUnreadArticle, deleteUnreadArticles, clearAllUnreadArticles, getState, setState } from '../storage/repo';
+import { saveArticle, trimOldArticles, listArticles, getArticle, deleteArticle, deleteArticles, clearAllArticles, listUnreadArticles, getUnreadArticle, saveUnreadArticle, deleteUnreadArticle, deleteUnreadArticles, clearAllUnreadArticles, getState, setState, listMagicItems, putMagicItem, removeMagicItem, clearMagicItems, loadSettings, saveSettings } from '../storage/repo';
 import { uuid } from '../utils/split';
 import { sampleForLanguage } from '../utils/sampleBlocks';
 import { buildBasePrompt, mockGenerateArticle, generateWithGemini } from '../utils/ai';
@@ -17,7 +17,7 @@ const colors: Record<string, string> = {
   box3: '#10b981', // emerald-500
 };
 
-export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockToBox: (id: string, targetBox: Block['box'], opts?: { prepend?: boolean }) => void }) {
+export function Reader({ userId, blocks, moveBlockToBox }: { userId?: string; blocks: Block[]; moveBlockToBox: (id: string, targetBox: Block['box'], opts?: { prepend?: boolean }) => void }) {
   // 將來會由 AI 生成文章 -> 這裡暫時保留 state，但不提供輸入框
   const [article, setArticle] = useState('');
   const [saving, setSaving] = useState(false);
@@ -66,8 +66,7 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   const [progressVisibleUntil, setProgressVisibleUntil] = useState<number | null>(null);
   // Magic Bag (收集詞彙) 狀態：僅複製，不影響原 block
   type MagicItem = { id: string; sourceBlockId: string; text: string; lang: Block['lang']; box: Block['box']; addedAt: number; copied?: boolean };
-  const [magicBag, setMagicBag] = useState<MagicItem[]>(()=>{
-    try { const raw = localStorage.getItem('reviewer.magicBag.v1'); if (raw) { const arr = JSON.parse(raw) as MagicItem[]; return Array.isArray(arr)? arr.map(i=>({...i})) : []; } } catch {} return []; });
+  const [magicBag, setMagicBag] = useState<MagicItem[]>([]);
   // Magic Bag 進階狀態
   const [magicNotice, setMagicNotice] = useState(''); // 顯示操作/重複提示
   const [duplicateHighlightId, setDuplicateHighlightId] = useState<string | null>(null); // 重複項目高亮
@@ -85,25 +84,29 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   });
   useEffect(()=>{ localStorage.setItem('reviewer.magicBag.order', magicOrder); }, [magicOrder]);
   useEffect(()=>{ localStorage.setItem('reviewer.magicBag.filter', magicFilter); }, [magicFilter]);
-  function persistMagicBag(next: MagicItem[]) { localStorage.setItem('reviewer.magicBag.v1', JSON.stringify(next)); }
-  function addToMagicBag(b: Block) {
-    setMagicBag(prev => {
-      const exist = prev.find(i=>i.sourceBlockId===b.id);
-      if (exist) { // 避免重複並提示 + 高亮
-        setMagicNotice('已在袋子中');
-        setDuplicateHighlightId(exist.id);
-        setTimeout(()=>setMagicNotice(''), 1500);
-        setTimeout(()=>setDuplicateHighlightId(id=> id===exist.id ? null : id), 1600);
-        return prev;
-      }
-      const next = [...prev, { id: uuid(), sourceBlockId: b.id, text: b.text, lang: b.lang, box: b.box, addedAt: Date.now() }];
-      persistMagicBag(next); return next;
-    });
+  async function addToMagicBag(b: Block) {
+    // 先用現有 state 判斷是否重複（避免不必要 upsert）
+    const exist = magicBag.find(i=> i.sourceBlockId === b.id);
+    if (exist) {
+      setMagicNotice('已在袋子中');
+      setDuplicateHighlightId(exist.id);
+      setTimeout(()=>setMagicNotice(''), 1500);
+      setTimeout(()=>setDuplicateHighlightId(id=> id===exist.id ? null : id), 1600);
+      return;
+    }
+    const it = { id: uuid(), sourceBlockId: b.id, text: b.text, lang: b.lang, box: b.box, addedAt: Date.now() } as any;
+    await putMagicItem(it);
+    // 直接本地更新（避免多一次讀 DB）；仍再抓一次確保一致性（可能有其他 tab 寫入）
+    setMagicBag(prev => [...prev, it]);
+    // 可選：最終以雲端 / Dexie 真實資料覆蓋
+    const list = await listMagicItems();
+    setMagicBag(list);
   }
-  function removeFromMagicBag(id: string) {
-    setMagicBag(prev => { const next = prev.filter(i=>i.id!==id); persistMagicBag(next); return next; });
+  async function removeFromMagicBag(id: string) {
+    await removeMagicItem(id);
+    const list = await listMagicItems(); setMagicBag(list);
   }
-  function clearMagicBag() { setMagicBag(()=>{ persistMagicBag([]); return []; }); }
+  async function clearMagicBag() { await clearMagicItems(); const list = await listMagicItems(); setMagicBag(list); }
   function toggleMagicSelect(id: string) {
     setSelectedMagic(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   }
@@ -135,11 +138,11 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
   copyText(list.map(i=>i.text).join('\n'));
   markItemsCopied(list.map(i=>i.id));
   }
-  function deleteSelectedMagic() {
+  async function deleteSelectedMagic() {
     if (!selectedMagic.size) return;
-    setMagicBag(prev => { const next = prev.filter(i=>!selectedMagic.has(i.id)); persistMagicBag(next); return next; });
-    setMagicNotice('已刪除'); setTimeout(()=>setMagicNotice(''), 1000);
-    exitMagicSelectMode();
+    for (const id of selectedMagic) { await removeMagicItem(id); }
+    const list = await listMagicItems(); setMagicBag(list);
+    setMagicNotice('已刪除'); setTimeout(()=>setMagicNotice(''), 1000); exitMagicSelectMode();
   }
   function selectAllMagic() {
     setSelectedMagic(new Set(magicBag.map(i=>i.id)));
@@ -170,9 +173,10 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     }
     markItemsCopied(source.map(i=>i.id));
   }
-  function markItemsCopied(ids: string[]) {
+  async function markItemsCopied(ids: string[]) {
     if (!ids.length) return;
-    setMagicBag(prev => { const set = new Set(ids); const next = prev.map(i=> set.has(i.id)? {...i, copied:true}: i); persistMagicBag(next); return next; });
+    setMagicBag(prev => prev.map(i=> ids.includes(i.id)? {...i, copied:true}: i));
+    // Optional: store copied flag locally only (not syncing). If want sync, extend magic_items schema and push.
   }
   const generationHistoryRef = useRef<number[]>([]); // 儲存每篇成功生成的 timestamp
   const cancelRef = useRef(false);
@@ -227,6 +231,18 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
         }
       }
     } catch {}
+  }, [userId]);
+
+  // 初始 & userId 改變時載入 magicItems
+  useEffect(()=>{
+    (async () => { const list = await listMagicItems(); setMagicBag(list as any); })();
+  }, [userId]);
+
+  // 監聽全域 wipe 事件
+  useEffect(()=> {
+    function onWiped() { setMagicBag([]); }
+    window.addEventListener('reviewer-wiped', onWiped);
+    return ()=> window.removeEventListener('reviewer-wiped', onWiped);
   }, []);
 
   function pruneHistory() {
@@ -267,32 +283,16 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
 
   // 初始化從 localStorage 載入暫存文章
   useEffect(() => {
-    // Step17: 先嘗試從 Dexie states 載入 currentArticle
     (async () => {
       try {
+        // 載入 currentArticle / lang
         const dexieRaw = await getState('currentArticleRaw');
         const dexieLang = await getState('currentArticleLang');
         if (dexieRaw) setArticle(dexieRaw);
         if (dexieLang === 'ja' || dexieLang === 'en') setLastLang(dexieLang as any);
-        // 若 Dexie 沒有，執行一次從 localStorage 的遷移（舊資料 → Dexie）
-        if (!dexieRaw) {
-          const legacyRaw = localStorage.getItem('reviewer.currentArticle.v1');
-          if (legacyRaw) { setArticle(legacyRaw); setState('currentArticleRaw', legacyRaw).catch(()=>{}); }
-        }
-        if (!dexieLang) {
-          const legacyLang = localStorage.getItem('reviewer.lastLang');
-            if (legacyLang === 'ja' || legacyLang === 'en') {
-              setLastLang(legacyLang as any);
-              setState('currentArticleLang', legacyLang).catch(()=>{});
-            }
-        }
-      } catch {}
-    })();
-    // 載入參數設定
-    const cfgRaw = localStorage.getItem('reviewer.reader.config.v1');
-    if (cfgRaw) {
-      try {
-        const cfg = JSON.parse(cfgRaw);
+        // 載入設定 (Dexie settings)
+        const s = await loadSettings();
+        const cfg = s.readerConfig || {};
         if (typeof cfg.totalWanted === 'number') setTotalWanted(cfg.totalWanted);
         if (cfg.overrideBox1 === '' || typeof cfg.overrideBox1 === 'number') setOverrideBox1(cfg.overrideBox1);
         if (cfg.overrideBox2 === '' || typeof cfg.overrideBox2 === 'number') setOverrideBox2(cfg.overrideBox2);
@@ -301,11 +301,11 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
         if (typeof cfg.style === 'string') setStyle(cfg.style);
         if (typeof cfg.maxLength === 'number') setMaxLength(cfg.maxLength);
       } catch {}
-    }
-    loadedConfigRef.current = true;
-  refreshList();
-  refreshUnreadList();
-  }, []);
+      loadedConfigRef.current = true;
+      refreshList();
+      refreshUnreadList();
+    })();
+  }, [userId]);
 
   // 保存設定
   useEffect(() => {
@@ -319,7 +319,8 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
       style,
       maxLength,
     };
-    localStorage.setItem('reviewer.reader.config.v1', JSON.stringify(cfg));
+  // 保存到 settings (Dexie) -> sync cloud
+  saveSettings({ readerConfig: cfg }).catch(()=>{});
   }, [totalWanted, overrideBox1, overrideBox2, overrideBox3, targetSentences, style, maxLength]);
 
   // 保存 Gemini 設定
@@ -327,7 +328,8 @@ export function Reader({ blocks, moveBlockToBox }: { blocks: Block[]; moveBlockT
     localStorage.setItem('reviewer.gemini.apiKey', geminiApiKey);
   }, [geminiApiKey]);
   useEffect(()=>{
-    localStorage.setItem('reviewer.gemini.model', geminiModel);
+    localStorage.setItem('reviewer.gemini.model', geminiModel); // backward compat
+    saveSettings({ geminiModel }).catch(()=>{});
   }, [geminiModel]);
 
   // 開發/暫時使用：可在 console 呼叫 window.setArticle('內容') 注入文章
