@@ -7,7 +7,7 @@ import { DraggableItem } from './components/DraggableItem';
 import type { Block, Box } from './types';
 import { splitToBlocks } from './utils/split';
 import { db } from './storage/db';
-import { getAllByBox, bulkAdd, upsert, clearAll as clearAllDB } from './storage/repo';
+import { getAllByBox, bulkAdd, upsert, clearAll as clearAllDB, wipeAllLocalData } from './storage/repo';
 import { Reader } from './components/Reader';
 import { supabase } from './shims/supabaseClient';
 import { syncAll, pullAll, syncState } from './storage/sync';
@@ -40,7 +40,34 @@ export default function App() {
   useEffect(()=> {
     supabase.auth.getUser().then((r:any)=> setSessionUser(r.data.user||null));
     const { data: sub } = supabase.auth.onAuthStateChange((_e: any, sess: any)=> {
-      setSessionUser(sess?.user||null);
+      const prevId = (sessionUser as any)?.id;
+      const nextUser = sess?.user || null;
+      const nextId = (nextUser as any)?.id;
+      // 若使用者 id 改變 -> 清空本地資料避免跨帳號殘留
+      if (prevId && nextId && prevId !== nextId) {
+        (async () => {
+          await wipeAllLocalData();
+          setBlocks([]);
+        })();
+      }
+      if (!prevId && nextId) {
+        // 首次登入：檢查本地資料是否屬於另一個帳號 (states.settings.lastUserId)
+        // 若有 mismatch 也清空
+        (async () => {
+          try {
+            const stored = localStorage.getItem('reviewer.lastUserId');
+            if (stored && stored !== nextId) {
+              await wipeAllLocalData();
+              setBlocks([]);
+            }
+            localStorage.setItem('reviewer.lastUserId', nextId);
+          } catch {}
+        })();
+      }
+      if (prevId && !nextId) {
+        // 登出：暫時保留本地？需求：離線練習可延續；不清除
+      }
+      setSessionUser(nextUser);
     });
     const t = setInterval(()=> forceTick(x=>x+1), 1000);
     return ()=> { sub.subscription.unsubscribe(); clearInterval(t); };
@@ -57,12 +84,12 @@ export default function App() {
     setAuthMsg('');
     if (!userEmail || !userPass) { setAuthMsg('輸入 email & 密碼'); return; }
     const { data, error } = await supabase.auth.signInWithPassword({ email: userEmail, password: userPass });
-    if (data.user) { setAuthMsg('登入成功'); await pullAll(true); refreshBlocks(); return; }
+  if (data.user) { setAuthMsg('登入成功'); try { localStorage.setItem('reviewer.lastUserId', data.user.id); } catch {}; await pullAll(true); refreshBlocks(); return; }
     if (error) {
       if (error.message.toLowerCase().includes('invalid')) {
         const { data: reg, error: regErr } = await supabase.auth.signUp({ email: userEmail, password: userPass });
         if (regErr) { setAuthMsg('註冊失敗: '+regErr.message); return; }
-        if (reg.user) { setAuthMsg('註冊完成 (若需驗證請查收)'); await pullAll(true); refreshBlocks(); }
+  if (reg.user) { setAuthMsg('註冊完成 (若需驗證請查收)'); try { localStorage.setItem('reviewer.lastUserId', reg.user.id); } catch {}; await pullAll(true); refreshBlocks(); }
       } else setAuthMsg(error.message);
     }
   }
